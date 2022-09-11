@@ -1,0 +1,307 @@
+clear
+clc
+yalmip('clear')
+%% input the system data
+% IEGS system
+[mpc,gtd,rts] = case24GEv8(); 
+mpc.gen(:,10) = 0; % 最小出力为0
+
+nb   = size(mpc.bus, 1);    %% number of buses
+nl = size(mpc.branch, 1);    %% number of branches
+nGb  = size(mpc.Gbus,1); % number of gas bus
+nGl = size(mpc.Gline,1);
+nGen = sum(mpc.gen(:,22)==1)+sum(mpc.gen(:,22)==0);% all gen(TFU and GFU), excluded dispatchable loads
+nGPP = size(mpc.gfuIndex,1);
+nGs = size(mpc.Gsou,1);
+nGd = size(find(mpc.Gbus(:,3)~=0),1);
+nPTG = size(mpc.ptg,1);
+id = find(mpc.bus(:,3)~=0);
+iGd = find(mpc.Gbus(:,3)~=0);
+
+% CH4, C2H6, C3H8, C4H10, H2, N2, CO2
+nGasType = 7; iCombustibleGas = 1:5; iNonCombustibleGas = 6:7;
+[GCVall, Mall, M_air, fsAll, aAll, R_air, T_stp, Prs_stp, Z_ng, ...
+    T_gas, eta_electrolysis,eta_methanation,etaGFU] = initializeParameters();
+M_ng = 17.478 * 1e-3;     % kg/mol
+gamma_ng = 1.32;
+% pipeline data
+% 先选个参数，大概算个burst pressure之类的，然后要和运行气压匹配，再调整
+alpha = 4; % year
+beta = 20; % mm-1
+H_pipe = 10; % 分成10个状态
+xi = 1; % model error for burst pressure
+sigma_ut = 4560; % ultimate tensile strength of the pipeline steel, bar
+T_ch = 6; % hydrogen charging time, hour
+kappa = 1.18736 - 0.09311*T_ch + 0.01541*T_ch^2 - 0.0008927*T_ch^3;
+psi = 0.8;
+
+dl0 = 300; % km, length of pipeline segment
+L = gtd.Gline(:,4) / 1000; % length of pipeline, km
+nSegmentForPipeline = ceil(L/dl0);
+dl = L./nSegmentForPipeline;
+nSegment = sum(nSegmentForPipeline);
+% reliability evaluation data
+H_electricityLoad = 3;% 设置5个负荷水平
+H_gasLoad = 3;
+nLoadLevel = H_electricityLoad * H_gasLoad;
+dt = 1; % year
+T = 20; % 30 year
+% 
+GEresult0 = GEopf_yalmip(mpc,[]);
+%%
+D = gtd.Gline(:,3) * 1000; % diameter, mm
+wt = 5.5*D/(2*sigma_ut/10*0.72); % wall thickness, mm 根据《油气集输设计规范》8.1.4条确定
+
+syms delta1 tau
+f_gamma = @(delta1,tau) ( beta.^(alpha.*tau) .* delta1.^(alpha.*tau-1) ...
+    .* exp(-beta.*delta1) ) ./ gamma(alpha.*tau); % 概率密度函数值是可以大于1的，积分才是概率
+
+% Pr_pipe = zeros(nGl,T,H_pipe);
+for ij = 1:nGl
+    for t = 1:T
+        for h = 1:H_pipe
+            Pr_pipe{ij}(t,h) = integral2(f_gamma, wt(ij)/H_pipe * (h-1),wt(ij)/H_pipe * h, dt*(t-1),dt*t);
+        end
+    end
+end
+
+
+for ij = 1:nGl
+    for h = 1:H_pipe
+        delta(ij,h) = wt(ij)/H_pipe * (h-0.5); % defect depth, mm
+        fai = 12 + (31-12)/wt(ij) * delta(ij,h); % defect length, mm
+        M_fl = sqrt(1 + 0.6275*fai^2/(D(ij)*wt(ij)) - 0.003375*fai^4/(D(ij)*wt(ij))^2);
+        p_bs(ij,h) = xi * (2*sigma_ut*wt(ij))/D(ij) * ( 1 - delta(ij,h)/wt(ij) * (1 - ...
+            exp( -0.157*fai/sqrt(D(ij)*(wt(ij)-delta(ij,h))/2))));
+        p_rp(ij,h) = (2*0.9*sigma_ut*wt(ij)) / (M_fl*D(ij));
+    end
+end
+% 计算把ptg替换成天然气的系统运行状态（可以先不算）
+
+
+%% 聚合肯定不会引发burst或rupture的pipe状态
+for ij = 1:nGl
+    fb = mpc.Gline(ij,1); tb = mpc.Gline(ij,2);
+    mergedStateIndex(ij) = min( [ ...
+        max(find(max(GEresult0.Gbus(fb,7),GEresult0.Gbus(tb,7)) < kappa*p_bs(ij,:))), ...
+        max(find(max(GEresult0.Gbus(fb,7),GEresult0.Gbus(tb,7)) < kappa*p_rp(ij,:))), ...
+        8]); %每个管道前几个要合并的状态
+    % 看看之后的计算还需要什么
+    nPipelineState(ij,1) = 10 - mergedStateIndex(ij) + 1;
+    for t = 1:T
+        for iSeg = 1:nSegmentForPipeline(ij)
+            Pr_pipe_merged{ij,1}(t,1) = sum(Pr_pipe{ij}(t,1:mergedStateIndex(ij)));
+            Pr_pipe_merged{ij,1}(t,2:(10-mergedStateIndex(ij)+1)) = Pr_pipe{ij}(t,(mergedStateIndex(ij)+1):end);
+        end
+    end
+    for h = 1:nPipelineState(ij)
+        if h == 1
+            delta_merged{ij,1}(h) = delta(ij,1);
+            burstPressure_merged{ij,1}(h) = p_bs(ij,1);
+            rupturePressure_merged{ij,1}(h) = p_rp(ij,1);
+        else
+            iState = H_pipe-(nPipelineState(ij)-h);
+            delta_merged{ij,1}(h) = delta(ij,iState);
+            burstPressure_merged{ij,1}(h) = p_bs(ij,iState);
+            rupturePressure_merged{ij,1}(h) = p_rp(ij,iState);
+        end
+    end
+end
+
+%% 计算state space考虑：一阶pipeline segment的腐蚀（但故障概率会积累），一阶线路故障（N-1），气源和发电机分别一阶故障
+% 一阶故障
+% 或者不要线路故障
+counter = 0;
+% nSystemState = nSegment*H_pipe*nl*nGs*nGen*nLoadLevel;
+% Info_components = zeros(nSystemState,7); % order: 坏的segment编号，segment状态，坏的线路编号，坏的气源编号，坏的发电机编号,电力负荷水平，天然气负荷水平
+% for iPipe = 1:nSegment
+%     for h  = 1:H_pipe
+%         for iBranch = 1:nl
+%             for iGsource = 1:nGs
+%                 for iGen = 1:nGen
+%                     for iElectricityLoad = 1:H_electricityLoad
+%                         for iGasLoad = 1:H_gasLoad
+%                             counter = counter + 1;
+%                             Info_components(counter,:) = [iPipe, h, iBranch, iGsource, iGen,iElectricityLoad,iGasLoad];
+%                         end
+%                     end
+%                 end
+%             end
+%         end
+%     end
+% end
+nSystemState = sum(nPipelineState.*nSegmentForPipeline)*(0*nl+1)*(nGs+1)*(nGen+1)*1;
+% 为减少场景数，只认为最大负荷可能会产生切负荷
+Info_components = zeros(nSystemState,8); 
+
+for iPipe = 1:nGl
+    for iSegment = 1:nSegmentForPipeline(iPipe)
+        for iSegmentState = 1:nPipelineState(iPipe)
+            for iBranch = 0:nl*0
+                for iGsource = 0:nGs
+                    for iGen = 0:nGen
+                        for iElectricityLoad = 3:H_electricityLoad
+                            for iGasLoad = 3:H_gasLoad
+                                counter = counter + 1;
+                                Info_components(counter,:) = [iPipe,iSegment,iSegmentState, iBranch, iGsource, iGen,iElectricityLoad,iGasLoad];
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+%% eliminate the scenarios with small probabilities
+stateProbability = zeros(T,nSystemState);
+smallProbabilityStates = zeros(nSystemState,1);
+
+for t = 1:T
+    for s = 1:nSystemState 
+        % calculate the probability of the state
+        stateProbability(t,s) = calculateStateProbability(Info_components(s,:),rts,Pr_pipe_merged,nGl,nSegmentForPipeline,nPipelineState,t);
+    end
+end
+counter = 0;
+for s = 1:nSystemState
+    if max(stateProbability(:,s)) < 1e-999 % 在所有年份概率都比较小，那就不用算了
+        smallProbabilityStates(s) = 1;
+        counter = counter + 1;
+    end
+end
+nReducedScenario = nSystemState - counter;
+save stop1.mat
+%%
+clc
+clear
+yalmip('clear')
+load stop1.mat
+
+
+[mpc,gtd,rts] = case24GEv8(); 
+nGd = size(find(mpc.Gbus(:,3)~=0),1);
+mpc.Gbus(:,3) = mpc.Gbus(:,3)*46.2980/48.9660; % 减少负荷数量，不然总气源能量不足
+mpc.branch(:,6:8) = mpc.branch(:,6:8)/1.5; % 线路容量/3
+mpc.branch([28,31,32,33],6) = mpc.branch([28,31,32,33],6)/1.5;
+mpc.Gsou(:,3) = 0; 
+mpc.gen(:,10) = 0;
+mpc.ptg(:,6) = 3;
+mpc.gen(24,9) = 0;% 减少个发电机，让电力系统能切负荷
+
+%--------------------------------
+% mpc.ptg(:,1) = [16;19;20];
+%--------------------------------
+nReducedScenario = nSystemState - counter;
+
+
+
+% Info_components = senarioReduction(Info_components,nSystemState);
+Info_components_reduced = Info_components(smallProbabilityStates==0,:);
+% electricityLoadCurtailment = zeros(nb,nReducedScenario);
+% gasLoadCurtailment = zeros(nGb,nReducedScenario);
+% deviationToACGR = zeros(nGb,nReducedScenario);
+electricityLoadCurtailment = cell(nReducedScenario,1);
+gasLoadCurtailment = cell(nReducedScenario,1);
+deviationToACGR = cell(nReducedScenario,1);
+solverTime = cell(nReducedScenario,1);
+yalmipTime = cell(nReducedScenario,1);
+
+tic
+for s = 1:nReducedScenario 
+    yalmip('clear')
+%----------test----------------
+%     s=234235
+% Info_components(s,:) = [1,1,1,0,0,23,3,3];
+% Info_components(s,:) = [7,1,3,0,0,0,3,3];
+    % determine whether need CMS 对于一些特例简化计算
+    % (如果发电机坏了线路没坏，只需要（发电-负荷）就行，不用OPF。天然气系统也一样
+    % 但是gas composition咋办？
+    % 如果只有gas系统坏了就认为gas composition也是合格的）
+%     [simplifiedFlag,electricityLoadCurtailment(:,s),gasLoadCurtailment(:,s),deviationToACGR(:,s)] ...
+%         = simplifiedCMS(Info_components(s,:),mpc,smallProbabilityStates(s),nb,nGb,id,iGd);
+%-----------test------------------
+simplifiedFlag = 0;
+% --------------------------------
+%     if smallProbabilityStates(s) == 0
+%     if simplifiedFlag == 0
+%         systemStateCounter = systemStateCounter + 1;
+        % if CMS is required, update the mpc (including the topological change of small leak)
+        newmpc1 = updatempc(mpc,Info_components(s,:),rts);
+%-----------test------------------
+% newmpc1.Gsou(1:4,4) = 0;
+% newmpc1.Gline(7,3) = 1e-4;
+% --------------------------------
+        % see it intrigered what kind of pipeline failure
+        [newGEresult1,information1,solution] = GEopf_yalmip(newmpc1,[]);
+        if information1.problem ~= 0 % see if successful
+            error('not converged');
+        end
+        % see if the results lead to pipeline failure, (and update the topology) 
+        [newmpc2,ruptureFlag] = topologicalUpdateFormpc(newGEresult1,newmpc1,gtd,Info_components(s,:),burstPressure_merged, ...
+            rupturePressure_merged,delta_merged,wt,dl,M_ng,gamma_ng,R_air,T_gas,psi,kappa);
+        % run GEOPF with natural gas, determine the direction
+        [newGEresult2,information2,solution] = GEopf_yalmip(newmpc2,[]);
+        
+        % see if it is contingency (if only load level changes, then not contignecy
+        contingencyFlag = ( sum(Info_components(s,[1,3,4,5])) > 0 );
+%-----------test------------------
+contingencyFlag = 0;
+% --------------------------------
+        [solutionWithAlternativeGas,information3] = OPFwithAlternativeGas2(newmpc2,newGEresult2,contingencyFlag);
+        
+%         electricityLoadCurtailment(id,systemStateCounter) = solutionWithAlternativeGas.LCe;
+%         gasLoadCurtailment(iGd,systemStateCounter) = solutionWithAlternativeGas.LCg(1:nGd);
+%         deviationToACGR(:,systemStateCounter) = sqrt(abs(solutionWithAlternativeGas.deviation_sum(1:nGb))); 
+        electricityLoadCurtailment{s} = solutionWithAlternativeGas.LCe;
+        gasLoadCurtailment{s} = solutionWithAlternativeGas.LCg(1:nGd);
+        deviationToACGR{s} = sqrt(abs(solutionWithAlternativeGas.deviation_sum(1:nGb))); 
+        if ruptureFlag ~= 0
+            gasLoadCurtailment{s} = gasLoadCurtailment{s} / 6;
+        end
+        solverTime{s} = information1.solvertime + information2.solvertime + information3.solvertime;
+        yalmipTime{s} = information1.yalmiptime + information2.yalmiptime + information3.yalmiptime;
+%     end
+
+end
+elapseTime1 = toc;
+save
+%%
+
+counter = 0;
+stateProbabilityReduced = zeros(T,nReducedScenario);
+for s = 1:nSystemState
+    if smallProbabilityStates(s) == 0
+        counter = counter + 1;
+        stateProbabilityReduced(:,counter) = stateProbability(:,s);
+    end
+end
+stateProbabilityReduced = stateProbabilityReduced ./ repmat(sum(stateProbabilityReduced,2),[1,nReducedScenario]);
+
+electricityLoadCurtailmentMatrix = zeros(nb,nReducedScenario);
+gasLoadCurtailmentMatrix = zeros(nGb,nReducedScenario);
+deviationToACGRmatrix = zeros(nGb,nReducedScenario);
+for s = 1:nReducedScenario
+    electricityLoadCurtailmentMatrix(id,s) = electricityLoadCurtailment{s};
+    gasLoadCurtailmentMatrix(iGd,s) = gasLoadCurtailment{s}(1:nGd);
+    deviationToACGRmatrix(:,s) = deviationToACGR{s}(1:nGb);
+end
+
+[EDNS,LOLP] = deal(zeros(nb,T)); [EGNS,LOGP,EGID,GIDP] = deal(zeros(nGb,T));
+for t = 1:20
+    for s = 1:nReducedScenario
+            EDNS(:,t) = EDNS(:,t) + electricityLoadCurtailmentMatrix(:,s) .* stateProbabilityReduced(t,s);
+            LOLP(:,t) = LOLP(:,t) + ( electricityLoadCurtailmentMatrix(:,s) > 1e-1 ) * stateProbabilityReduced(t,s);
+            EGNS(:,t) = EGNS(:,t) + gasLoadCurtailmentMatrix(:,s) * stateProbabilityReduced(t,s);
+            LOGP(:,t) = LOGP(:,t) + ( gasLoadCurtailmentMatrix(:,s) > 1e-4 ) * stateProbabilityReduced(t,s);
+            EGID(:,t) = EGID(:,t) + deviationToACGRmatrix(:,s) * stateProbabilityReduced(t,s);
+            GIDP(:,t) = GIDP(:,t) + ( deviationToACGRmatrix(:,s) > 1e-4 ) * stateProbabilityReduced(t,s);
+    end
+end
+elapseTime2 = toc;
+save
+    
+
+    
+
+
+
