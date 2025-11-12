@@ -1,0 +1,25 @@
+
+t=1;s=10;
+stateProbability(t,s) = calculateStateProbability(Info_components(s,:),rts,Pr_pipe_merged,nGl,nSegmentForPipeline,nPipelineState,t);
+%%
+[EDNS,LOLP] = deal(zeros(nb,T)); [EGNS,LOGP,EGID,GIDP] = deal(zeros(nGb,T));
+for t = 1:T
+    stateCounter = 0;
+    for s = 1:nSystemState
+        if smallProbabilityStates(s) == 0
+            stateCounter = stateCounter + 1;
+            EDNS(:,t) = EDNS(:,t) + electricityLoadCurtailment(:,stateCounter) .* stateProbability(t,stateCounter);
+            LOLP(:,t) = LOLP(:,t) + ( electricityLoadCurtailment(:,stateCounter) > 1e-4 ) * stateProbability(t,stateCounter);
+            EGNS(:,t) = EGNS(:,t) + gasLoadCurtailment(:,stateCounter) * stateProbability(t,stateCounter);
+            LOGP(:,t) = LOGP(:,t) + ( gasLoadCurtailment(:,stateCounter) > 1e-4 ) * stateProbability(t,stateCounter);
+            EGID(:,t) = EGID(:,t) + deviationToACGR(:,stateCounter) * stateProbability(t,stateCounter);
+            GIDP(:,t) = GIDP(:,t) + ( deviationToACGR(:,stateCounter) > 1e-4 ) * stateProbability(t,stateCounter);
+        end
+    end
+end
+%%
+GCV_nodal0 = gasComposition/100 * GCVall';
+S_nodal0 = gasComposition/100 * Mall' / M_air;
+S_nodal0 = S_ng;
+sqrtS0 = 0.5 * (S_nodal0/sqrt(S_ng) + sqrt(S_ng));
+WI_nodal0 = GCV_nodal0 ./ sqrtS0 / 1e6; % 如果不能自动转化，那就手动化一下

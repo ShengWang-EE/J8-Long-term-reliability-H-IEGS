@@ -1,0 +1,29 @@
+20220521
+PTG生产量很少
+-能量转换公式出了问题
+20220522
+发电成本不收敛，出现很多切负荷。gurobi numerical problem
+mosek提示marix奇异，是来源于gasFlowSOCcons的    PHI >= gasFlow_sum.^2 ./ C.^2;
+没解决这个问题。但是把优化变量sigma_x标幺化后，解决了Pg在迭代过程中波动的问题（应该就是numerical problem导致的）
+gasFlow必须和管道整体方向一致？
+-或者不管，其他文献都是用能量平衡的，可能更加有这个问题
+Qd的成分有问题
+
+为什么这项会导致奇异
+PHI(3) >= gasFlow_sum(3).^2 ./ C(3).^2 ;
+
+S_nodal不能收敛其实很正常
+20220529
+Qptg有没有符号问题？
+不是，是nodalgas injection 的问题
+
+是什么造成了氢气非得往回流
+
+有时候solver出现numerical problem可以无视（能求解出结果的），下一次迭代可能又好了
+
+20220606
+gaspressure不对
+-公式写错了
+
+20220607
+还有个错误，Snodal算错了
